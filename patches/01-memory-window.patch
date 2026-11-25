@@ -157,3 +157,17 @@
  
  /* ---------------------------------------------------------------- timing */
  /* clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME): macOS has none */
+--- a/ext/port_headers/port_include/dolphin/types.h
++++ b/ext/port_headers/port_include/dolphin/types.h
+@@ -80,8 +80,9 @@
+  * other host. */
+ #if defined(__APPLE__) && defined(__aarch64__)
+ /* (Pokémon Colosseum: one window, host/colo.h's COLO_BASE, for both halves) */
+-#define PORT_GAME_LO 0x10000000000ull
+-#define PORT_GAME_HI 0x10000000000ull
++/* (448 GiB: the one 4 GiB window iOS gives an app with extended virtual addressing; free on macOS too) */
++#define PORT_GAME_LO 0x7000000000ull
++#define PORT_GAME_HI 0x7000000000ull
+ #else
+ #define PORT_GAME_LO 0ull
+ #define PORT_GAME_HI 0ull
