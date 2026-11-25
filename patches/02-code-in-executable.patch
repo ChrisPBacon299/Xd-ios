@@ -28,10 +28,115 @@
      else:
 +        # arm64: data addressed absolutely, so the code can run from the executable while its data stays in the
 +        # window (tools/a64abs.py, tools/link_macos.py: iOS)
-+        if ARM64: script('a64abs.py', [b + '.s'])
++        if ARM64: script('a64abs.py', [b + '.s', inp])
          run(CLANG + ASSEMBLE + [b + '.s', '-o', out])
          if not ARM64: script('fix32s.py', [out])
      if key:
+--- a/host/macos.c
++++ b/host/macos.c
+@@ -90,15 +90,15 @@
+     colo_game_lo = lo; colo_game_hi = hi;
+     for (u32 i = 0; i < colo_imp_n; i++) colo_imp_tab[i] = (u64)(uintptr_t)colo_imp_addrs[i];
+ #ifdef __aarch64__
+-    for (int i = 0; i < eh->phnum; i++) {
+-        const Elf64Phdr* ph = (const Elf64Phdr*)(elf + eh->phoff + (u64)i * eh->phentsize);
+-        if (ph->type != 1 || !ph->memsz || !(ph->flags & 1)) continue;   /* PF_X */
+-        u64 from = ph->vaddr & ~0x3FFFull, to = (ph->vaddr + ph->memsz + 0x3FFF) & ~0x3FFFull;
+-        sys_icache_invalidate((void*)(uintptr_t)from, to - from);
+-        if (mprotect((void*)(uintptr_t)from, to - from, PROT_READ | PROT_EXEC) != 0) {
+-            fprintf(stderr, "cannot make the game's code executable: %s\n", strerror(errno));
+-            exit(1);
+-        }
++    /* The code runs from the executable (tools/link_macos.py: iOS runs only signed code), where the system put it, so
++     * the data that holds a code address is moved by as much. The image's own copy of the code is left as data. */
++    {
++        extern const u8 colo_game_text[], colo_game_text_end[];
++        extern const u64 colo_game_text_link, colo_game_text_fixups[];
++        extern const u32 colo_game_text_nfixups;
++        u64 delta = (u64)(uintptr_t)colo_game_text - colo_game_text_link;
++        for (u32 i = 0; i < colo_game_text_nfixups; i++) *(u64*)(uintptr_t)colo_game_text_fixups[i] += delta;
++        colo_game_lo = (u64)(uintptr_t)colo_game_text; colo_game_hi = (u64)(uintptr_t)colo_game_text_end;
+     }
+ #endif
+     for (void (**f)(void) = colo_game_init_array_start; f < colo_game_init_array_end; f++) (*f)();
+--- a/tools/a64abs.py
++++ b/tools/a64abs.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python3
++"""a64abs.py UNIT.s [UNIT.be.ll]: (arm64) make a game unit's assembly address its data absolutely.
++
++The game's code runs from the executable (iOS runs only signed code) while its data stays in the 4 GiB window, about
++444 GiB away: out of reach of adrp's +-4 GiB. A Darwin target is always position independent, so clang has no large
++code model for it (it would build each address with movz/movk). So the assembly is rewritten:
++
++* adrp xN, sym            ->  movz/movk xN, sym (all four 16-bit parts), then and xN, xN, ~0xFFF:
++                              the same page address, absolute, and the :lo12:sym users that follow stay as they are;
++* adrp xN, :got:sym       ->  movz/movk xN, sym: the address itself, absolute (no GOT entry), and
++  ldr xD, [xB, :got_lo12:sym] ->  mov xD, xB.
++
++An adrp to a function (a label of this unit's code, or a function the unit's IR declares or defines) is left alone, and a
++function's GOT load becomes adrp/add: code addressing code relatively moves with it. Anything else relative that reaches
++data, the link refuses with a list (tools/link_macos.py)."""
++import re, sys
++
++path = sys.argv[1]
++lines = open(path, encoding='utf-8', errors='surrogateescape').read().split('\n')
++# the functions the unit names (its IR's declare and define lines)
++functions = set()
++if len(sys.argv) > 2:
++    fn_re = re.compile(r'^(?:declare|define)\b[^@]*@("[^"]*"|[-\w.$]+)\(')
++    for l in open(sys.argv[2], encoding='utf-8', errors='surrogateescape'):
++        m = fn_re.match(l)
++        if m: functions.add(m.group(1))
++
++# the labels this unit defines in code sections
++code_labels, section_code = set(), True
++sec_re = re.compile(r'^\s*\.(text|data|bss|section\s+([^,\s]+).*)\s*$')
++for l in lines:
++    m = sec_re.match(l)
++    if m:
++        name = m.group(2) or m.group(1)
++        section_code = name == 'text' or name.startswith('.text') or 'TEXT' in name
++        continue
++    lm = re.match(r'^([A-Za-z_.$][\w.$]*|"[^"]*"):', l)
++    if lm and section_code: code_labels.add(lm.group(1))
++
++adrp_re = re.compile(r'^(\s*)adrp\s+(x\d+),\s*(:got:)?(.+?)\s*(//.*)?$')
++gotld_re = re.compile(r'^(\s*)ldr\s+(x\d+),\s*\[(x\d+),\s*:got_lo12:(.+?)\]\s*(//.*)?$')
++
++def base_symbol(expr):
++    m = re.match(r'^([A-Za-z_.$][\w.$]*|"[^"]*")', expr)
++    return m.group(1) if m else None
++
++def absolute(ind, reg, expr):
++    return [f'{ind}movz\t{reg}, #:abs_g3:{expr}', f'{ind}movk\t{reg}, #:abs_g2_nc:{expr}',
++            f'{ind}movk\t{reg}, #:abs_g1_nc:{expr}', f'{ind}movk\t{reg}, #:abs_g0_nc:{expr}']
++
++out, changed = [], 0
++for l in lines:
++    m = adrp_re.match(l)
++    if m:
++        ind, reg, got, expr = m.group(1), m.group(2), m.group(3), m.group(4)
++        sym = base_symbol(expr)
++        if sym in code_labels or sym in functions:
++            # code: relative stays (a GOT entry would be data, so a function's address is made directly)
++            out.append(f'{ind}adrp\t{reg}, {expr}' if got else l); continue
++        out += absolute(ind, reg, expr)
++        if not got: out.append(f'{ind}and\t{reg}, {reg}, #0xfffffffffffff000')
++        changed += 1
++        continue
++    m = gotld_re.match(l)
++    if m:
++        ind, dst, base = m.group(1), m.group(2), m.group(3)
++        if base_symbol(m.group(4)) in code_labels or base_symbol(m.group(4)) in functions:
++            out.append(f'{ind}add\t{dst}, {base}, :lo12:{m.group(4)}')
++            changed += 1
++            continue
++        out.append(f'{ind}mov\t{dst}, {base}' if dst != base else f'{ind}// (the address is already in {base})')
++        changed += 1
++        continue
++    out.append(l)
++open(path, 'w', encoding='utf-8', errors='surrogateescape').write('\n'.join(out))
 --- a/tools/link_macos.py
 +++ b/tools/link_macos.py
 @@ -20,6 +20,87 @@
@@ -179,94 +284,3 @@
          sh(g['HOSTCC'] + ['-c', L + '/%s.s' % s, '-o', L + '/%s.o' % s])
          link_objs.append(L + '/%s.o' % s)
  
---- a/host/macos.c
-+++ b/host/macos.c
-@@ -90,15 +90,15 @@
-     colo_game_lo = lo; colo_game_hi = hi;
-     for (u32 i = 0; i < colo_imp_n; i++) colo_imp_tab[i] = (u64)(uintptr_t)colo_imp_addrs[i];
- #ifdef __aarch64__
--    for (int i = 0; i < eh->phnum; i++) {
--        const Elf64Phdr* ph = (const Elf64Phdr*)(elf + eh->phoff + (u64)i * eh->phentsize);
--        if (ph->type != 1 || !ph->memsz || !(ph->flags & 1)) continue;   /* PF_X */
--        u64 from = ph->vaddr & ~0x3FFFull, to = (ph->vaddr + ph->memsz + 0x3FFF) & ~0x3FFFull;
--        sys_icache_invalidate((void*)(uintptr_t)from, to - from);
--        if (mprotect((void*)(uintptr_t)from, to - from, PROT_READ | PROT_EXEC) != 0) {
--            fprintf(stderr, "cannot make the game's code executable: %s\n", strerror(errno));
--            exit(1);
--        }
-+    /* The code runs from the executable (tools/link_macos.py: iOS runs only signed code), where the system put it, so
-+     * the data that holds a code address is moved by as much. The image's own copy of the code is left as data. */
-+    {
-+        extern const u8 colo_game_text[], colo_game_text_end[];
-+        extern const u64 colo_game_text_link, colo_game_text_fixups[];
-+        extern const u32 colo_game_text_nfixups;
-+        u64 delta = (u64)(uintptr_t)colo_game_text - colo_game_text_link;
-+        for (u32 i = 0; i < colo_game_text_nfixups; i++) *(u64*)(uintptr_t)colo_game_text_fixups[i] += delta;
-+        colo_game_lo = (u64)(uintptr_t)colo_game_text; colo_game_hi = (u64)(uintptr_t)colo_game_text_end;
-     }
- #endif
-     for (void (**f)(void) = colo_game_init_array_start; f < colo_game_init_array_end; f++) (*f)();
---- a/tools/a64abs.py
-+++ b/tools/a64abs.py
-@@ -0,0 +1,61 @@
-+#!/usr/bin/env python3
-+"""a64abs.py UNIT.s: (arm64) make a game unit's assembly address its data absolutely.
-+
-+The game's code runs from the executable (iOS runs only signed code) while its data stays in the 4 GiB window, about
-+444 GiB away: out of reach of adrp's +-4 GiB. A Darwin target is always position independent, so clang has no large
-+code model for it (it would build each address with movz/movk). So the assembly is rewritten:
-+
-+* adrp xN, sym            ->  movz/movk xN, sym (all four 16-bit parts), then and xN, xN, ~0xFFF:
-+                              the same page address, absolute, and the :lo12:sym users that follow stay as they are;
-+* adrp xN, :got:sym       ->  movz/movk xN, sym: the address itself, absolute (no GOT entry), and
-+  ldr xD, [xB, :got_lo12:sym] ->  mov xD, xB.
-+
-+An adrp to a label of this unit's code is left alone: code addressing code relatively moves with it. Anything else
-+relative that reaches data, the link refuses with a list (tools/link_macos.py)."""
-+import re, sys
-+
-+path = sys.argv[1]
-+lines = open(path, encoding='utf-8', errors='surrogateescape').read().split('\n')
-+
-+# the labels this unit defines in code sections
-+code_labels, section_code = set(), True
-+sec_re = re.compile(r'^\s*\.(text|data|bss|section\s+([^,\s]+).*)\s*$')
-+for l in lines:
-+    m = sec_re.match(l)
-+    if m:
-+        name = m.group(2) or m.group(1)
-+        section_code = name == 'text' or name.startswith('.text') or 'TEXT' in name
-+        continue
-+    lm = re.match(r'^([A-Za-z_.$][\w.$]*|"[^"]*"):', l)
-+    if lm and section_code: code_labels.add(lm.group(1))
-+
-+adrp_re = re.compile(r'^(\s*)adrp\s+(x\d+),\s*(:got:)?(.+?)\s*(//.*)?$')
-+gotld_re = re.compile(r'^(\s*)ldr\s+(x\d+),\s*\[(x\d+),\s*:got_lo12:(.+?)\]\s*(//.*)?$')
-+
-+def base_symbol(expr):
-+    m = re.match(r'^([A-Za-z_.$][\w.$]*|"[^"]*")', expr)
-+    return m.group(1) if m else None
-+
-+def absolute(ind, reg, expr):
-+    return [f'{ind}movz\t{reg}, #:abs_g3:{expr}', f'{ind}movk\t{reg}, #:abs_g2_nc:{expr}',
-+            f'{ind}movk\t{reg}, #:abs_g1_nc:{expr}', f'{ind}movk\t{reg}, #:abs_g0_nc:{expr}']
-+
-+out, changed = [], 0
-+for l in lines:
-+    m = adrp_re.match(l)
-+    if m:
-+        ind, reg, got, expr = m.group(1), m.group(2), m.group(3), m.group(4)
-+        if base_symbol(expr) in code_labels and not got:
-+            out.append(l); continue
-+        out += absolute(ind, reg, expr)
-+        if not got: out.append(f'{ind}and\t{reg}, {reg}, #0xfffffffffffff000')
-+        changed += 1
-+        continue
-+    m = gotld_re.match(l)
-+    if m:
-+        ind, dst, base = m.group(1), m.group(2), m.group(3)
-+        out.append(f'{ind}mov\t{dst}, {base}' if dst != base else f'{ind}// (the address is already in {base})')
-+        changed += 1
-+        continue
-+    out.append(l)
-+open(path, 'w', encoding='utf-8', errors='surrogateescape').write('\n'.join(out))
