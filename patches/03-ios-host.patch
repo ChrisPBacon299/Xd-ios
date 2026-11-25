@@ -218,3 +218,23 @@
 +    return SDL_UIKitRunApp(argc, argv, run);
 +}
 +#endif
+--- a/host/crash.c
++++ b/host/crash.c
+@@ -37,8 +37,17 @@
+ #include <mach-o/getsect.h>
+ #include <mach-o/ldsyms.h>
+ #include <mach/mach.h>
++#ifdef COLO_IOS
++/* iOS has neither mach_vm.h nor libproc: the same calls by their vm_ names, and no file names for regions */
++#define mach_vm_address_t vm_address_t
++#define mach_vm_size_t vm_size_t
++#define mach_vm_read_overwrite vm_read_overwrite
++#define mach_vm_region_recurse vm_region_recurse_64
++static int proc_regionfilename(int pid, u64 address, void* buffer, u32 size) { (void)pid; (void)address; (void)buffer; (void)size; return 0; }
++#else
+ #include <mach/mach_vm.h>
+ #include <libproc.h>
++#endif
+ extern char** environ;
+ #else
+ #include <sys/uio.h>
