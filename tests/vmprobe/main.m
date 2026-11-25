@@ -108,26 +108,40 @@ static void probe(void) {
     say(@"\nused base: %llu GiB", good / GiB);
 }
 
-@interface App : UIResponder <UIApplicationDelegate>
+// UIKit's scene lifecycle: required of apps built with the iOS 27 SDK (they do not launch without it)
+@interface Scene : UIResponder <UIWindowSceneDelegate>
 @property (strong) UIWindow *window;
 @end
-@implementation App
-- (BOOL)application:(UIApplication *)a didFinishLaunchingWithOptions:(NSDictionary *)o {
-    probe();
+@implementation Scene
+- (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)o {
+    if (!out) probe();
     NSLog(@"%@", out);
-    self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    self.window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
     UIViewController *vc = [UIViewController new];
     UITextView *t = [[UITextView alloc] initWithFrame:vc.view.bounds];
     t.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     t.editable = NO;
     t.font = [UIFont monospacedSystemFontOfSize:15 weight:UIFontWeightRegular];
     t.textContainerInset = UIEdgeInsetsMake(60, 16, 40, 16);
+    t.backgroundColor = UIColor.systemIndigoColor;   // so the window's edges show
+    t.textColor = UIColor.whiteColor;
     t.text = out;
     [vc.view addSubview:t];
     self.window.rootViewController = vc;
     [self.window makeKeyAndVisible];
-    UIPasteboard.generalPasteboard.string = out;   // so it can be pasted back
-    return YES;
+    UIPasteboard.generalPasteboard.string = out;
+}
+@end
+
+@interface App : UIResponder <UIApplicationDelegate>
+@end
+@implementation App
+- (BOOL)application:(UIApplication *)a didFinishLaunchingWithOptions:(NSDictionary *)o { return YES; }
+- (UISceneConfiguration *)application:(UIApplication *)a configurationForConnectingSceneSession:(UISceneSession *)s
+                              options:(UISceneConnectionOptions *)o {
+    UISceneConfiguration *c = [[UISceneConfiguration alloc] initWithName:@"Main" sessionRole:s.role];
+    c.delegateClass = Scene.class;
+    return c;
 }
 @end
 
