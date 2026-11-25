@@ -8,6 +8,7 @@ on:
     paths:
       - .github/workflows/mac-probe.yml
       - pins.env
+      - patches/**
 permissions:
   contents: write
 jobs:
@@ -42,6 +43,10 @@ jobs:
             fetch "$COLO_DECOMP_REPO" "$COLO_DECOMP_COMMIT" port/deps/pkmn-colosseum
           fi
           ls port port/deps port/tools port/host | head -200
+
+      - name: Apply the iOS changes
+        run: |
+          for p in patches/*.patch; do echo "applying $p"; git -C port apply --whitespace=nowarn "$PWD/$p"; done
 
       - name: Record the build layout
         run: |

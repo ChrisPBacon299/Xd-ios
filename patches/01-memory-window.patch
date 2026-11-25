@@ -1,0 +1,159 @@
+--- a/tools/befix.py
++++ b/tools/befix.py
+@@ -1009,7 +1009,7 @@
+ FLT = ('float', 'double')
+ ARM64_TRIPLE = 'arm64-apple-macos11.0-elf'
+ ARM64_LAYOUT = 'e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32'
+-COLO_BASE = 1 << 40
++COLO_BASE = 448 << 30   # 0x7000000000: the 4 GiB window iOS allows (host/colo.h)
+ # what is truly variadic, with the number of named parameters: the game's own functions (a unit may
+ # see them through a declaration without `...`) and the host's that game code may see unprototyped
+ ARM64_VARIADIC = {'_vmThreadCreate': 6, 'cmsRunSync': 2, 'fn_800060F0': 3, 'fn_80006378': 2, 'fn_80029FAC': 4, 'fn_8002A0B8': 4,
+--- a/tools/link_macos.py
++++ b/tools/link_macos.py
+@@ -28,7 +28,7 @@
+     OBJCOPY, NM, LLD, sh = g['OBJCOPY'], g['NM'], g['LLD'], g['sh']
+     wrapped = re.findall(r'--wrap=(\w+)', g['WRAP'])
+     ARM64 = g['ARM64']
+-    BASE = 1 << 40 if ARM64 else 0   # COLO_BASE (host/colo.h)
++    BASE = 448 << 30 if ARM64 else 0   # COLO_BASE (host/colo.h)
+     from concurrent.futures import ThreadPoolExecutor
+ 
+     def write_if_changed(path, text):
+--- a/host/colo.h
++++ b/host/colo.h
+@@ -52,7 +52,8 @@
+ #define COLO_XD_ARENA_HI 0x81C00000u
+ 
+ #if defined(__APPLE__) && defined(__aarch64__)
+-#define COLO_BASE 0x10000000000ull   /* 1 TiB, far above what the system maps (tools/befix.py's COLO_BASE) */
++#define COLO_BASE 0x7000000000ull   /* 448 GiB: the one 4 GiB window iOS gives an app with extended virtual
++                                       addressing; free on macOS too (tools/befix.py's COLO_BASE) */
+ #else
+ #define COLO_BASE 0ull
+ #endif
+--- a/host/main.c
++++ b/host/main.c
+@@ -261,7 +261,11 @@
+     /* one memory object seen at the cached (0x80000000) and uncached (0xC0000000) addresses
+      * and at its physical addresses (DMA-style uses of a pointer), as on the console; the
+      * first 64 KiB of the physical view cannot be mapped (vm.mmap_min_addr) */
+-#ifdef __APPLE__
++#if defined(__APPLE__) && defined(__aarch64__)
++    /* iOS refuses shm_open: MEM1 is anonymous shared memory, its other views made by vm_remap
++     * (colo_mmap_noreplace, macos.c, takes this descriptor to mean it) */
++    int memfd = COLO_MEM1_FD;
++#elif defined(__APPLE__)
+     /* an unlinked shared memory object (macOS has no memfd_create) */
+     char shm_name[64]; snprintf(shm_name, sizeof shm_name, "/colo-mem1-%d", (int)getpid());
+     int memfd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0600);
+@@ -269,7 +273,12 @@
+ #else
+     int memfd = memfd_create("colo-mem1", 0);
+ #endif
+-    if (memfd < 0 || ftruncate(memfd, 0x02000000) != 0) colo_fatal("cannot create MEM1");
++    #if defined(__APPLE__) && defined(__aarch64__)
++    if (0)
++#else
++    if (memfd < 0 || ftruncate(memfd, 0x02000000) != 0)
++#endif
++        colo_fatal("cannot create MEM1");
+     if (mmap(G(MEM1_BASE), 0x02000000, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED_NOREPLACE, memfd, 0) != G(MEM1_BASE))
+         colo_fatal("cannot map MEM1 at 0x80000000");
+     if (mmap(G(0xC0000000), 0x02000000, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED_NOREPLACE, memfd, 0) != G(0xC0000000))
+--- a/host/macos.h
++++ b/host/macos.h
+@@ -29,6 +29,9 @@
+ /* mmap at exactly addr, but only where nothing is mapped yet (Linux's MAP_FIXED_NOREPLACE):
+  * MAP_FAILED otherwise */
+ void* colo_mmap_noreplace(void* addr, size_t len, int prot, int flags, int fd, long long off);
++/* (arm64) MEM1's descriptor for colo_mmap_noreplace: the first mapping is anonymous shared memory,
++ * the others views of it (vm_remap), as iOS has no shm_open */
++#define COLO_MEM1_FD (-1000)
+ 
+ struct timespec;
+ void colo_sleep_until(const struct timespec* t);   /* CLOCK_MONOTONIC */
+--- a/host/macos.c
++++ b/host/macos.c
+@@ -261,6 +261,73 @@
+ _Static_assert(COLO_MEM1_PHYS_LO == 0x400000u, "tools/link_macos.py's -segaddr __COLOLOW");
+ __asm__(".globl _colo_mem1_phys_reserve\n.zerofill __COLOLOW,__mem1phys,_colo_mem1_phys_reserve," COLO_MEM1_PHYS_RESERVE ",14\n");
+ #endif
++#ifdef __aarch64__
++/* iOS ignores an address that is only a hint, and gives an app one 4 GiB window, at 448 GiB
++ * (COLO_BASE). So the window (and MEM1's mirror just above it) is reserved once, and each
++ * mapping in it is exact (MAP_FIXED) over that reservation, refused where an earlier one is:
++ * a page map of the window says which. Outside it, the range must be free (vm_region). */
++#include <mach/mach.h>
++#define WIN_PAGE 0x4000ull
++#define WIN_SIZE (0x100000000ull + 0x04000000ull)   /* the window, and 64 MiB above it */
++static u8 win_taken[WIN_SIZE / WIN_PAGE / 8];
++static int win_reserved;
++static void* mem1_first;
++static u64 mem1_size;
++
++static int win_has(u64 a, u64 len) { return a >= COLO_BASE && a + len <= COLO_BASE + WIN_SIZE; }
++static int win_check(u64 a, u64 len, int take)
++{
++    for (u64 p = (a - COLO_BASE) / WIN_PAGE, e = (a - COLO_BASE + len + WIN_PAGE - 1) / WIN_PAGE; p < e; p++) {
++        if (!take && (win_taken[p >> 3] >> (p & 7) & 1)) return 0;
++        if (take) win_taken[p >> 3] |= (u8)(1 << (p & 7));
++    }
++    return 1;
++}
++static int range_free(u64 a, u64 len)
++{
++    vm_address_t q = (vm_address_t)a; vm_size_t qs = 0; natural_t depth = 0;
++    vm_region_submap_info_data_64_t info; mach_msg_type_number_t n = VM_REGION_SUBMAP_INFO_COUNT_64;
++    if (vm_region_recurse_64(mach_task_self(), &q, &qs, &depth, (vm_region_recurse_info_t)&info, &n) != KERN_SUCCESS) return 1;
++    return q >= a + len;
++}
++static void win_reserve(void)
++{
++    if (win_reserved) return;
++    win_reserved = 1;
++    void* p = range_free(COLO_BASE, WIN_SIZE)
++        ? mmap((void*)(uintptr_t)COLO_BASE, WIN_SIZE, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) : MAP_FAILED;
++    if (p != (void*)(uintptr_t)COLO_BASE) {
++        fprintf(stderr, "cannot reserve the game's memory window at %llx: %s\n", (unsigned long long)COLO_BASE, strerror(errno));
++        exit(1);
++    }
++}
++
++void* colo_mmap_noreplace(void* addr, size_t len, int prot, int flags, int fd, long long off)
++{
++    u64 a = (u64)(uintptr_t)addr;
++    win_reserve();
++    int in = win_has(a, len);
++    if (in ? !win_check(a, len, 0) : !range_free(a, len)) { errno = EEXIST; return MAP_FAILED; }
++    void* p;
++    if (fd == COLO_MEM1_FD && mem1_first) {
++        /* another view of MEM1: the same pages */
++        if ((u64)off + len > mem1_size) { errno = EINVAL; return MAP_FAILED; }
++        vm_address_t to = (vm_address_t)a; vm_prot_t cur, max;
++        kern_return_t k = vm_remap(mach_task_self(), &to, len, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
++                                   (vm_address_t)mem1_first + (vm_address_t)off, FALSE, &cur, &max, VM_INHERIT_NONE);
++        if (k != KERN_SUCCESS) { errno = ENOMEM; return MAP_FAILED; }
++        p = addr;
++    } else if (fd == COLO_MEM1_FD) {
++        p = mmap(addr, len, prot, MAP_SHARED | MAP_ANON | MAP_FIXED, -1, 0);
++        if (p == addr) { mem1_first = p; mem1_size = len; }
++    } else {
++        p = mmap(addr, len, prot, flags | MAP_FIXED, fd, (off_t)off);
++    }
++    if (p != addr) { if (p != MAP_FAILED) munmap(p, len); errno = errno ? errno : ENOMEM; return MAP_FAILED; }
++    if (in) win_check(a, len, 1);
++    return p;
++}
++#else
+ void* colo_mmap_noreplace(void* addr, size_t len, int prot, int flags, int fd, long long off)
+ {
+     /* without MAP_FIXED the address is a hint the kernel takes when the range is free */
+@@ -269,6 +336,7 @@
+     if (p != addr) { munmap(p, len); errno = EEXIST; return MAP_FAILED; }
+     return p;
+ }
++#endif
+ 
+ /* ---------------------------------------------------------------- timing */
+ /* clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME): macOS has none */
