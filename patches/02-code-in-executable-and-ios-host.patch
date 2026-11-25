@@ -284,7 +284,15 @@
                              '-Wl,-segaddr,__COLOLOW,0x400000',   # COLO_MEM1_PHYS_LO (host/macos.h)
 --- a/host/macos.c
 +++ b/host/macos.c
-@@ -90,15 +90,15 @@
+@@ -31,6 +31,7 @@
+ #include <time.h>
+ #include <errno.h>
+ #ifdef __aarch64__
++#include <mach/mach.h>
+ #include <libkern/OSCacheControl.h>
+ #define COLO_ELF_MACHINE 183   /* EM_AARCH64 */
+ #else
+@@ -90,15 +91,25 @@
      colo_game_lo = lo; colo_game_hi = hi;
      for (u32 i = 0; i < colo_imp_n; i++) colo_imp_tab[i] = (u64)(uintptr_t)colo_imp_addrs[i];
  #ifdef __aarch64__
@@ -306,6 +314,16 @@
 +        u64 delta = (u64)(uintptr_t)colo_game_text - colo_game_text_link;
 +        for (u32 i = 0; i < colo_game_text_nfixups; i++) *(u64*)(uintptr_t)colo_game_text_fixups[i] += delta;
 +        colo_game_lo = (u64)(uintptr_t)colo_game_text; colo_game_hi = (u64)(uintptr_t)colo_game_text_end;
++        /* and the same code shown at its place in the image too (the signed pages themselves, shared, as the
++         * Objective-C runtime's trampolines are made): game code and data name functions by those addresses, and
++         * may call one directly */
++        vm_address_t to = (vm_address_t)colo_game_text_link;
++        vm_size_t len = ((u64)(colo_game_text_end - colo_game_text) + 0x3FFF) & ~0x3FFFull;
++        vm_prot_t cur, max;
++        kern_return_t k = vm_remap(mach_task_self(), &to, len, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
++                                   (vm_address_t)colo_game_text, FALSE, &cur, &max, VM_INHERIT_SHARE);
++        fprintf(stderr, "game code at %llx, shown at %llx too: %s\n", (unsigned long long)(uintptr_t)colo_game_text,
++                (unsigned long long)colo_game_text_link, k == KERN_SUCCESS && to == (vm_address_t)colo_game_text_link ? "yes" : "NO");
      }
  #endif
      for (void (**f)(void) = colo_game_init_array_start; f < colo_game_init_array_end; f++) (*f)();
