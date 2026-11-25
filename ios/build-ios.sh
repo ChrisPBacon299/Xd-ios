@@ -51,7 +51,7 @@ echo "== the renderer for iOS"
 cmake -G Ninja -S ext/sms_gx -B build/sms_gx -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
     -DCMAKE_OSX_DEPLOYMENT_TARGET="$IOS_MIN" -DCMAKE_BUILD_TYPE=RelWithDebInfo -DSMS_GX_BUILD_TESTS=OFF \
     -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH -DSDL2_DIR="$SDL_OUT/lib/cmake/SDL2"
-ninja -C build/sms_gx -j"$JOBS"
+ninja -C build/sms_gx -j"$JOBS" -k 0   # (-k 0: every error at once)
 
 echo "== the app"
 COLO_IOS=1 COLO_IOS_MIN="$IOS_MIN" $PY -I tools/link.py

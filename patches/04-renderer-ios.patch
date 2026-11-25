@@ -1,0 +1,38 @@
+--- a/ext/sms_gx/src/mtl/glmtl_device.mm
++++ b/ext/sms_gx/src/mtl/glmtl_device.mm
+@@ -2,7 +2,13 @@
+ #include "glmtl.h"
+ #include "glmtl_impl.h"
+ 
++#include <TargetConditionals.h>
++#if TARGET_OS_IPHONE
++#include <objc/runtime.h>   /* (iOS has no objc-runtime.h) */
++#include <objc/message.h>
++#else
+ #include <objc/objc-runtime.h>
++#endif
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -72,7 +78,9 @@
+ }
+ 
+ void applyVsync() {
++#if !TARGET_OS_IPHONE   /* (iOS always waits for the display) */
+     if (s_layer) s_layer.displaySyncEnabled = s_vsync != 0;
++#endif
+ }
+ 
+ }  // namespace
+@@ -286,9 +294,11 @@
+             s_layer.framebufferOnly = YES;
+             s_layer.maximumDrawableCount = 3;
+             // the game's colours are sRGB's: without this they would go to a wide-gamut screen as they are
++#if !TARGET_OS_IPHONE   /* (iOS takes a layer's colours as sRGB already) */
+             CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+             s_layer.colorspace = srgb;
+             CGColorSpaceRelease(srgb);
++#endif
+             applyVsync();
+         }
+ #endif
