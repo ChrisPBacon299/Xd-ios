@@ -30,6 +30,7 @@
 	<key>UIFileSharingEnabled</key><true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key><true/>
 	<key>GCSupportsControllerUserInteraction</key><true/>
+	<key>UIApplicationSupportsIndirectInputEvents</key><true/>
 	<key>GCSupportedGameControllers</key>
 	<array><dict><key>ProfileName</key><string>ExtendedGamepad</string></dict></array>
 	<!-- UIKit's scene life cycle (required of apps built with the iOS 27 SDK); SDL's patched delegate gives the scene -->

@@ -415,7 +415,7 @@
  #ifdef __APPLE__
 --- a/host/ios.m
 +++ b/host/ios.m
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,95 @@
 +/* iOS (COLO_IOS): the app around the port's main (main.c, built as colo_port_main there).
 + *
 + * SDL's UIKit app delegate starts it once UIKit has the app's scene (SDL is patched for the scene life cycle an app
@@ -423,7 +423,8 @@
 + * - the files: the app's Documents folder (Files: On My iPhone > the app) is the game folder. The disc is the first
 + *   .iso or .gcm there whose header is this game's (GC6E01 or GXXE01); saves go in Documents/Saves, crash reports and
 + *   state in Library, and the game's own log in Documents/log.txt, to share when something goes wrong;
-+ * - the settings: Metal, 4:3 (the game's own shape), 60 fps and 3x internal resolution, unless set already. */
++ * - the settings: Metal, 4:3 (the game's own shape), 60 fps, 3x internal resolution, full screen and 16x texture filtering,
++ *   unless set already. */
 +#ifdef COLO_IOS
 +#import <UIKit/UIKit.h>
 +#include <SDL.h>
@@ -489,7 +490,8 @@
 +        set_default("SMS_GX_SCALE", "3");
 +        set_default("COLO_FPS", "60");
 +        set_default("COLO_WIDESCREEN", "4:3");
-+        set_default("SMS_GX_FULLSCREEN", "1");
++        set_default("SMS_FULLSCREEN", "1");   /* the window is the screen, whatever iOS does to the layout */
++        set_default("SMS_ANISO", "16");       /* sharp textures at an angle, as the PC version has them */
 +
 +        if (!getenv("COLO_DISC")) {
 +            NSString* disc = find_disc(docs);
