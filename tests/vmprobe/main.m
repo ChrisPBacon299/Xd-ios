@@ -20,31 +20,39 @@ static void probe(void) {
     say(@"app code at 0x%lx (%.2f GiB)", (unsigned long)exe, exe / (double)GiB);
     say(@"memory limit: %.0f MB available", os_proc_available_memory() / 1e6);
 
-    // 1. Reserve a 4 GiB window at each candidate base (a hint, never MAP_FIXED over something).
-    uint64_t bases[] = { 8 * GiB, 16 * GiB, 32 * GiB, 48 * GiB, 64 * GiB, 128 * GiB, 256 * GiB, 512 * GiB, 1024 * GiB };
-    say(@"\n4 GiB window at:");
-    uint64_t good = 0;
-    for (unsigned i = 0; i < sizeof bases / sizeof *bases; i++) {
-        void *p = mmap((void *)bases[i], 4 * GiB, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
-        BOOL ok = p == (void *)bases[i];
-        int64_t dist = (int64_t)(bases[i] + 0x80000000ull) - (int64_t)exe;
-        say(@"  %4llu GiB: %@  (MEM1 %.1f GiB from code)", bases[i] / GiB,
-            ok ? @"OK" : p == MAP_FAILED ? [NSString stringWithFormat:@"failed (%s)", strerror(errno)]
-                                         : [NSString stringWithFormat:@"moved to %.1f GiB", (uint64_t)p / (double)GiB],
-            dist / (double)GiB);
+    // 1. Where iOS puts a 4 GiB window when asked (it ignores a plain hint).
+    uint64_t placed[4] = {0};
+    say(@"\n4 GiB window, system's choice:");
+    for (int i = 0; i < 4; i++) {
+        void *p = mmap(NULL, 4 * GiB, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        placed[i] = p == MAP_FAILED ? 0 : (uint64_t)p;
+        say(@"  try %d: %@", i + 1, p == MAP_FAILED ? [NSString stringWithFormat:@"failed (%s)", strerror(errno)]
+                                                  : [NSString stringWithFormat:@"%.2f GiB%@", (uint64_t)p / (double)GiB,
+                                                     ((uint64_t)p & (4 * GiB - 1)) ? @"" : @" (4 GiB aligned)"]);
         if (p != MAP_FAILED) munmap(p, 4 * GiB);
-        if (ok && !good) good = bases[i];
     }
 
-    // 2. Anywhere 4 GiB aligned (what the system gives when asked for 8 GiB and trimmed).
-    void *any = mmap(NULL, 8 * GiB, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    say(@"\nany 8 GiB: %@", any == MAP_FAILED ? [NSString stringWithFormat:@"failed (%s)", strerror(errno)]
-                                              : [NSString stringWithFormat:@"at %.1f GiB", (uint64_t)any / (double)GiB]);
-    if (any != MAP_FAILED) munmap(any, 8 * GiB);
-    if (!good) { say(@"\nno fixed window worked"); return; }
+    // 2. Fixed addresses (MAP_FIXED), only where nothing is mapped: checked first with a hint-free probe.
+    uint64_t fixed[] = { 64 * GiB, 128 * GiB, 256 * GiB, 384 * GiB, 448 * GiB, 456 * GiB, 480 * GiB, 504 * GiB };
+    uint64_t good = 0;
+    say(@"\nFixed 4 GiB window at:");
+    for (unsigned i = 0; i < sizeof fixed / sizeof *fixed; i++) {
+        // never over something already mapped: is the range free?
+        vm_address_t a = fixed[i]; vm_size_t sz = 0; uint32_t depth = 0;
+        vm_region_submap_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+        kern_return_t kr = vm_region_recurse_64(mach_task_self(), &a, &sz, &depth, (vm_region_recurse_info_t)&info, &cnt);
+        BOOL busy = kr == KERN_SUCCESS && a < fixed[i] + 4 * GiB;
+        if (busy) { say(@"  %4llu GiB: something already there", fixed[i] / GiB); continue; }
+        void *p = mmap((void *)fixed[i], 4 * GiB, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+        BOOL ok = p == (void *)fixed[i];
+        say(@"  %4llu GiB: %@", fixed[i] / GiB, ok ? @"OK" : [NSString stringWithFormat:@"failed (%s)", strerror(errno)]);
+        if (ok) { munmap(p, 4 * GiB); if (!good) good = fixed[i]; }
+    }
+    if (!good) for (int i = 0; i < 4 && !good; i++) if (placed[i] && !(placed[i] & (4 * GiB - 1))) good = placed[i];
+    if (!good) { say(@"\nno usable window"); return; }
 
     // 3. MEM1 (24 MiB) committed at window+0x80000000 and mirrored at +0xC0000000 and +0x00000000.
-    uint8_t *win = mmap((void *)good, 4 * GiB, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    uint8_t *win = mmap((void *)good, 4 * GiB, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
     uint8_t *mem1 = win + 0x80000000ull;
     size_t sz = 24 << 20;
     void *m = mmap(mem1, sz, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED | MAP_ANON, -1, 0);
@@ -62,7 +70,7 @@ static void probe(void) {
     say(@"shm_open: %@", fd < 0 ? [NSString stringWithFormat:@"failed (%s)", strerror(errno)] : @"OK");
     if (fd >= 0) { close(fd); shm_unlink("/colo.probe"); }
     munmap(win, 4 * GiB);
-    say(@"\nfirst good base: %llu GiB", good / GiB);
+    say(@"\nused base: %llu GiB", good / GiB);
 }
 
 @interface App : UIResponder <UIApplicationDelegate>
