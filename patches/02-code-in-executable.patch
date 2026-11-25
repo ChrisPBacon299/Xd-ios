@@ -1,6 +1,17 @@
 --- a/tools/cc_unit.py
 +++ b/tools/cc_unit.py
-@@ -52,7 +52,9 @@
+@@ -17,7 +17,9 @@
+ LOWER = ['--target=x86_64-linux-gnux32', '-fno-pic', '-O2', '-Wno-everything', '-S']
+ ASSEMBLE = ['--target=x86_64-w64-windows-gnu', '-Wno-everything', '-c'] if WINDOWS else ['--target=x86_64-linux-gnu', '-c']
+ if ARM64:
+-    LOWER = ['--target=arm64-apple-macos11.0-elf', '-fno-pic', '-O2', '-ffp-contract=off', '-Wno-everything', '-S']
++    # (jump tables of whole words: tools/a64abs.py makes code longer after the compiler sized them in bytes)
++    LOWER = ['--target=arm64-apple-macos11.0-elf', '-fno-pic', '-O2', '-ffp-contract=off', '-Wno-everything',
++             '-mllvm', '-aarch64-enable-compress-jump-tables=false', '-S']
+     ASSEMBLE = ['--target=arm64-apple-macos11.0-elf', '-c']
+ 
+ 
+@@ -52,7 +54,9 @@
  if mode == 'obj':
      inp, out = sys.argv[2], sys.argv[3]
      b = out[:-2]
@@ -11,7 +22,7 @@
      if key and unit_cache.fetch(key, [('.o', out)]):
          unit_cache.count(True)
          sys.exit(0)
-@@ -61,6 +63,9 @@
+@@ -61,6 +65,9 @@
          script('coffasm.py', [b + '.s', b + '.coff.s'])
          run(CLANG + ASSEMBLE + [b + '.coff.s', '-o', out])
      else:
