@@ -23,7 +23,7 @@ jobs:
             gh release create probe -R "$GITHUB_REPOSITORY" --draft --title "Build probe (private draft)" --notes "Logs and source snapshots for working on the iOS build. Draft: not public."
   probe:
     needs: release
-    runs-on: macos-15
+    runs-on: ${{ vars.MAC_RUNNER || 'macos-14' }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
