@@ -8,7 +8,6 @@ on:
     paths:
       - .github/workflows/mac-probe.yml
       - pins.env
-      - patches/**
 permissions:
   contents: write
 jobs:
