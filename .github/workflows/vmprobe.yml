@@ -12,16 +12,27 @@ permissions:
   contents: write
 jobs:
   build:
-    runs-on: macos-15
+    # the newest Xcode: the iPhone Duo lays out an app natively only when it was built with the iOS 27.1 SDK or newer
+    runs-on: xcode-27
     steps:
       - uses: actions/checkout@v4
+      - name: Pick the newest Xcode (iOS 27.1 SDK or newer)
+        run: |
+          ls -d /Applications/Xcode*.app
+          X=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          sudo xcode-select -s "$X/Contents/Developer"
+          SDK=$(xcrun --sdk iphoneos --show-sdk-version)
+          echo "Xcode $X, iOS SDK $SDK"
+          echo "::notice title=SDK::Xcode $(basename $X), iOS SDK $SDK"
+          printf '%s\n27.1\n' "$SDK" | sort -V -C -r || { echo "::error::iOS SDK $SDK is older than 27.1"; exit 1; }
+          echo "IOS_SDK=$SDK" >> "$GITHUB_ENV"
       - name: Build the IPA
         run: |
           set -e
           APP=build/Payload/VMProbe.app
           mkdir -p "$APP"
           xcrun -sdk iphoneos clang -target arm64-apple-ios16.0 -fobjc-arc -O1 \
-            tests/vmprobe/main.m -framework UIKit -framework Foundation -o "$APP/VMProbe"
+            -DIOS_SDK=\"$IOS_SDK\" tests/vmprobe/main.m -framework UIKit -framework Foundation -o "$APP/VMProbe"
           cp tests/vmprobe/Info.plist "$APP/Info.plist"
           plutil -convert binary1 "$APP/Info.plist"
           codesign -f -s - --entitlements tests/vmprobe/entitlements.plist "$APP"

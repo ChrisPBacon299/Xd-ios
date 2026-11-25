@@ -17,6 +17,7 @@ static const uint64_t GiB = 1ull << 30;
 static void probe(void) {
     out = [NSMutableString string];
     uintptr_t exe = (uintptr_t)_dyld_get_image_header(0);
+    say(@"built with iOS SDK %s", IOS_SDK);
     say(@"app code at 0x%lx (%.2f GiB)", (unsigned long)exe, exe / (double)GiB);
     say(@"memory limit: %.0f MB available", os_proc_available_memory() / 1e6);
 
