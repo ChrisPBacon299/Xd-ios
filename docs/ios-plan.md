@@ -14,6 +14,15 @@ What the Mac (Apple silicon) build does, what iOS allows, and what changes. Find
 | `shm_open` | refused (Operation not permitted) |
 | App code | about 4 GiB, slid each launch |
 
+## Building for the phone (vmprobe 1.3, 1.4)
+
+* The iPhone Duo lays an app out natively only when it was built with the iOS 27.1 SDK or newer; older builds run
+  boxed in the middle of the screen. The `xcode-27` runner has Xcode 27.2 (iOS SDK 27.2): builds use it and fail on
+  anything older than 27.1.
+* An app built with the iOS 27 SDK must use UIKit's scene life cycle or it exits at launch (1.3 crashed, 1.4 with a
+  scene delegate runs and fills the Duo's screen). SDL2 has no scene support (SDL3 added it in October 2025), so the
+  game needs SDL2 patched for scenes, or SDL3 (with sdl2-compat).
+
 ## Changes
 
 1. **Memory base.** `COLO_BASE` from 1 TiB to 448 GiB (`0x7000000000`) in `tools/befix.py` and
