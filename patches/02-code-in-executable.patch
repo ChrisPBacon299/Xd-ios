@@ -1,0 +1,187 @@
+--- a/tools/cc_unit.py
++++ b/tools/cc_unit.py
+@@ -17,7 +17,9 @@
+ LOWER = ['--target=x86_64-linux-gnux32', '-fno-pic', '-O2', '-Wno-everything', '-S']
+ ASSEMBLE = ['--target=x86_64-w64-windows-gnu', '-Wno-everything', '-c'] if WINDOWS else ['--target=x86_64-linux-gnu', '-c']
+ if ARM64:
+-    LOWER = ['--target=arm64-apple-macos11.0-elf', '-fno-pic', '-O2', '-ffp-contract=off', '-Wno-everything', '-S']
++    # -mcmodel=large: every address is absolute (movz/movk), none relative to the code, so the code can run from
++    # the signed executable while the data it names stays in the window (tools/link_macos.py, iOS)
++    LOWER = ['--target=arm64-apple-macos11.0-elf', '-fno-pic', '-mcmodel=large', '-O2', '-ffp-contract=off', '-Wno-everything', '-S']
+     ASSEMBLE = ['--target=arm64-apple-macos11.0-elf', '-c']
+ 
+ 
+--- a/tools/link_macos.py
++++ b/tools/link_macos.py
+@@ -20,6 +20,87 @@
+ import os, re, shutil, subprocess, sys
+ 
+ 
++# ---------------------------------------------------------------- arm64: the code out of the image
++# The game image (ELF, at window + 0x20000000) keeps its data there, where game code's 32-bit pointers reach it, but its
++# code runs from the executable: iOS runs only signed code, never code mapped at run time. Game code addresses its data
++# absolutely (-mcmodel=large, cc_unit.py) and the rest of its code relatively, so it runs anywhere, as long as it moves
++# whole and by whole pages. What it cannot have: code addressing data relatively, or holding a code address absolutely.
++# Data holding a code address (the constructor list, initialised function pointers) is corrected at startup by how far
++# the code moved: game_text_fixups.s lists where (host/macos.c).
++import struct
++R_PREL = {273: 'LD_PREL_LO19', 274: 'ADR_PREL_LO21', 275: 'ADR_PREL_PG_HI21', 276: 'ADR_PREL_PG_HI21_NC',
++          280: 'CONDBR19', 282: 'JUMP26', 283: 'CALL26', 279: 'TSTBR14', 261: 'PREL32', 260: 'PREL64', 262: 'PREL16'}
++R_PAGEOFF = {277, 278, 284, 285, 286, 299}   # the low 12 bits of an address: unchanged by a move of whole pages
++R_MOVW_ABS = {263, 264, 265, 266, 267, 268, 269}
++R_ABS64 = 257
++
++def _elf(path):
++    d = open(path, 'rb').read()
++    shoff, = struct.unpack_from('<Q', d, 0x28)
++    shentsize, shnum, shstrndx = struct.unpack_from('<HHH', d, 0x3A)
++    secs = [struct.unpack_from('<IIQQQQIIQQ', d, shoff + i * shentsize) for i in range(shnum)]
++    def name(off, tab): e = d.index(b'\0', tab + off); return d[tab + off:e].decode('latin-1')
++    strtab_off = secs[shstrndx][4]
++    out = []
++    for s in secs:
++        out.append({'name': name(s[0], strtab_off), 'type': s[1], 'flags': s[2], 'addr': s[3], 'off': s[4], 'size': s[5],
++                    'link': s[6], 'info': s[7], 'entsize': s[9]})
++    phoff, = struct.unpack_from('<Q', d, 0x20)
++    phentsize, phnum = struct.unpack_from('<HH', d, 0x36)
++    phs = [struct.unpack_from('<IIQQQQQQ', d, phoff + i * phentsize) for i in range(phnum)]
++    return d, out, phs
++
++def game_text(L):
++    d, secs, phs = _elf(L + '/game.elf')
++    code = [p for p in phs if p[0] == 1 and p[1] & 1 and p[6]]   # PT_LOAD, PF_X
++    if len(code) != 1: raise SystemExit('the game image has %d code segments, not one' % len(code))
++    _, _, off, vaddr, _, filesz, memsz, _ = code[0]
++    if vaddr & 0x3FFF: raise SystemExit('the game code is not on a page boundary (%x)' % vaddr)
++    lo, hi = vaddr, vaddr + memsz
++    blob = d[off:off + filesz] + b'\0' * (memsz - filesz)
++    if not os.path.exists(L + '/game_text.bin') or open(L + '/game_text.bin', 'rb').read() != blob:
++        open(L + '/game_text.bin', 'wb').write(blob)
++    # every relocation the link kept: what refers to the code, and what the code refers to
++    symtab = next(s for s in secs if s['type'] == 2)
++    syms = [struct.unpack_from('<IBBHQQ', d, symtab['off'] + i * 24) for i in range(symtab['size'] // 24)]
++    strs = secs[symtab['link']]['off']
++    def sname(i): o = strs + syms[i][0]; return d[o:d.index(b'\0', o)].decode('latin-1')
++    in_code = lambda a: lo <= a < hi
++    fixups, bad = [], {}
++    for rs in secs:
++        if rs['type'] != 4: continue   # SHT_RELA
++        target = secs[rs['info']]
++        if not target['flags'] & 2: continue   # not loaded (debug info)
++        exec_sec = bool(target['flags'] & 4)
++        for i in range(rs['size'] // 24):
++            r_off, r_info, r_add = struct.unpack_from('<QQq', d, rs['off'] + i * 24)
++            t, si = r_info & 0xFFFFFFFF, r_info >> 32
++            dest = syms[si][4] + r_add if si else r_add
++            where = r_off   # (a linked file's relocations give the address)
++            if exec_sec:
++                if t in R_PREL and not in_code(dest):
++                    bad.setdefault('code addresses data relatively (%s)' % R_PREL[t], []).append((where, sname(si)))
++                elif t in R_MOVW_ABS and in_code(dest):
++                    bad.setdefault('code holds a code address', []).append((where, sname(si)))
++                elif t == R_ABS64 and in_code(dest):
++                    bad.setdefault('code holds a code address (data in code)', []).append((where, sname(si)))
++            else:
++                if t == R_ABS64 and in_code(dest): fixups.append(where)
++                elif t in R_PREL and in_code(dest) and target['name'] != '.eh_frame':
++                    bad.setdefault('data addresses code relatively (%s, %s)' % (R_PREL[t], target['name']), []).append((where, sname(si)))
++    if bad:
++        for why, places in sorted(bad.items()):
++            print('%s: %d, such as %s' % (why, len(places), ', '.join('%s at %x' % (n, a) for a, n in places[:8])))
++        raise SystemExit('the game code cannot move into the executable')
++    src = ['# generated by tools/link_macos.py: where the game image\'s data holds a code address, moved by host/macos.c',
++           '.section __DATA,__const', '.p2align 3', '.globl _colo_game_text_fixups', '_colo_game_text_fixups:']
++    src += ['  .quad 0x%X' % a for a in sorted(set(fixups))]
++    src += ['.p2align 2', '.globl _colo_game_text_nfixups', '_colo_game_text_nfixups:', '  .long %d' % len(set(fixups))]
++    open(L + '/game_text_fixups.s', 'w').write('\n'.join(src) + '\n')
++    print('game code %x-%x (%d KiB), %d data fixups' % (lo, hi, (hi - lo) >> 10, len(set(fixups))))
++    return lo, hi
++
++
+ def link(g):
+     P, B, L, EXE, S = g['P'], g['B'], g['L'], g['EXE'], g['S']   # S: the shared build folder (deps, renderer), XD's B being build/xd-game
+     objs, host_objs, gen_objs = g['objs'], g['host_objs'], g['gen_objs']
+@@ -73,6 +154,9 @@
+     # ---- the image, first without imports: what it leaves undefined
+     LLD_FLAGS = ['--image-base=0x%X' % (BASE + 0x20000000), '-z', 'max-page-size=0x4000', '-z', 'norelro', '--build-id=none',
+                  '--no-demangle', '--allow-multiple-definition', '--error-limit=0', '-e', 'colo_imp_tab']
++    # arm64: the code goes into the executable (iOS runs only signed code), so it gets a segment of its own on a page
++    # boundary, and the relocations stay in the image, for finding what refers to it
++    if ARM64: LLD_FLAGS += ['-z', 'separate-code', '--emit-relocs']
+     REFS = ('# symbols the executable reads from the image: the linker defines them when they are named\n'
+             '.section .data.colo_refs,"aw"\n.p2align 3\n'
+             '.quad __init_array_start, __init_array_end\n'
+@@ -82,7 +166,9 @@
+         s = ['# generated by tools/link_macos.py: the image\'s imports, a jump through a slot host/macos.c fills', '.text']
+         for i, n in enumerate(names):
+             s += ['.p2align 3', '.globl %s' % asm_name(n), '.type %s,@function' % asm_name(n), '%s:' % asm_name(n)]
+-            s += ['  adrp x16, colo_imp_tab+%d' % (8 * i), '  ldr x16, [x16, :lo12:colo_imp_tab+%d]' % (8 * i), '  br x16'] if ARM64 \
++            s += ['  movz x16, #:abs_g3:colo_imp_tab+%d' % (8 * i), '  movk x16, #:abs_g2_nc:colo_imp_tab+%d' % (8 * i),
++                  '  movk x16, #:abs_g1_nc:colo_imp_tab+%d' % (8 * i), '  movk x16, #:abs_g0_nc:colo_imp_tab+%d' % (8 * i),
++                  '  ldr x16, [x16]', '  br x16'] if ARM64 \
+                 else ['  jmp *colo_imp_tab+%d(%%rip)' % (8 * i)]
+         s += ['.data', '.p2align 3', '.globl colo_imp_tab', 'colo_imp_tab:', '  .zero %d' % max(8, 8 * len(names)), REFS]
+         return '\n'.join(s) + '\n'
+@@ -163,15 +249,20 @@
+         if a is None: unresolved.append(n); del exports[n]
+     if unresolved: print('warning: the image lacks', ' '.join(unresolved))
+     src = ['# generated by tools/link_macos.py: the game image\'s symbols the host names, at their addresses']
+-    if ARM64: src += ['.text', '.p2align 2']
++    if ARM64:
++        text_lo, text_hi = game_text(L)
++        # the game's code itself, carried in the executable's own code (signed: iOS runs nothing else), at a page
++        # boundary as it is in the image, so the image's page-relative addressing within it still holds
++        src += ['.section __TEXT,__colo_game,regular,pure_instructions', '.p2align 14', '.globl _colo_game_text',
++                '_colo_game_text:', '.incbin "%s"' % (L + '/game_text.bin'), '.globl _colo_game_text_end', '_colo_game_text_end:']
+     for n, a in sorted(exports.items()):
+-        if ARM64 and n in efuncs:
+-            # the image is out of a call's range: an absolute jump, through a scratch register
+-            src += ['.globl %s' % asm_name('_' + n), '%s:' % asm_name('_' + n)]
+-            src += ['  movz x16, #0x%X' % (a & 0xFFFF), '  movk x16, #0x%X, lsl #16' % (a >> 16 & 0xFFFF),
+-                    '  movk x16, #0x%X, lsl #32' % (a >> 32 & 0xFFFF), '  br x16']
++        if ARM64 and n in efuncs and text_lo <= a < text_hi:
++            # a function: its place in that code
++            src += ['.globl %s' % asm_name('_' + n), '%s = _colo_game_text + 0x%X' % (asm_name('_' + n), a - text_lo)]
+         else:
+             src += ['.globl %s' % asm_name('_' + n), '%s = 0x%08X' % (asm_name('_' + n), a)]
++    if ARM64:
++        src += ['.section __DATA,__const', '.p2align 3', '.globl _colo_game_text_link', '_colo_game_text_link:', '  .quad 0x%X' % text_lo]
+     write_if_changed(L + '/game_exports.s', '\n'.join(src) + '\n')
+     src = ['# generated by tools/link_macos.py: the host\'s addresses for the image\'s import slots (imports.s order)',
+            '.section __DATA,__const', '.p2align 3', '.globl _colo_imp_addrs', '_colo_imp_addrs:']
+@@ -179,7 +270,7 @@
+     src += ['.p2align 2', '.globl _colo_imp_n', '_colo_imp_n:', '  .long %d' % len(imports)]
+     write_if_changed(L + '/host_imports.s', '\n'.join(src) + '\n')
+     link_objs = []
+-    for s in ('game_exports', 'host_imports'):
++    for s in ('game_exports', 'host_imports') + (('game_text_fixups',) if ARM64 else ()):
+         sh(g['HOSTCC'] + ['-c', L + '/%s.s' % s, '-o', L + '/%s.o' % s])
+         link_objs.append(L + '/%s.o' % s)
+ 
+--- a/host/macos.c
++++ b/host/macos.c
+@@ -90,15 +90,15 @@
+     colo_game_lo = lo; colo_game_hi = hi;
+     for (u32 i = 0; i < colo_imp_n; i++) colo_imp_tab[i] = (u64)(uintptr_t)colo_imp_addrs[i];
+ #ifdef __aarch64__
+-    for (int i = 0; i < eh->phnum; i++) {
+-        const Elf64Phdr* ph = (const Elf64Phdr*)(elf + eh->phoff + (u64)i * eh->phentsize);
+-        if (ph->type != 1 || !ph->memsz || !(ph->flags & 1)) continue;   /* PF_X */
+-        u64 from = ph->vaddr & ~0x3FFFull, to = (ph->vaddr + ph->memsz + 0x3FFF) & ~0x3FFFull;
+-        sys_icache_invalidate((void*)(uintptr_t)from, to - from);
+-        if (mprotect((void*)(uintptr_t)from, to - from, PROT_READ | PROT_EXEC) != 0) {
+-            fprintf(stderr, "cannot make the game's code executable: %s\n", strerror(errno));
+-            exit(1);
+-        }
++    /* The code runs from the executable (tools/link_macos.py: iOS runs only signed code), where the system put it, so
++     * the data that holds a code address is moved by as much. The image's own copy of the code is left as data. */
++    {
++        extern const u8 colo_game_text[], colo_game_text_end[];
++        extern const u64 colo_game_text_link, colo_game_text_fixups[];
++        extern const u32 colo_game_text_nfixups;
++        u64 delta = (u64)(uintptr_t)colo_game_text - colo_game_text_link;
++        for (u32 i = 0; i < colo_game_text_nfixups; i++) *(u64*)(uintptr_t)colo_game_text_fixups[i] += delta;
++        colo_game_lo = (u64)(uintptr_t)colo_game_text; colo_game_hi = (u64)(uintptr_t)colo_game_text_end;
+     }
+ #endif
+     for (void (**f)(void) = colo_game_init_array_start; f < colo_game_init_array_end; f++) (*f)();

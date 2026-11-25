@@ -73,6 +73,15 @@ jobs:
           /bin/sh ./build.sh 2>&1 | tee ../probe/build.log
           ls -la build | tee -a ../probe/build.log
 
+      - name: Start it with no disc (checks the code loads and runs from the executable)
+        if: always()
+        run: |
+          cd port
+          exe=$(ls build/colosseum build/xd build/xd-game/xd 2>/dev/null | head -1)
+          echo "running $exe"
+          SMS_HEADLESS=1 SDL_VIDEODRIVER=offscreen perl -e 'alarm 60; exec @ARGV' "./$exe" 2>&1 | tail -20 | tee ../probe/run.log || true
+          grep -q "disc image needed" ../probe/run.log && echo "LOADER OK" | tee -a ../probe/run.log
+
       - name: Keep the logs and a source snapshot (draft release, not public)
         if: always()
         env:
