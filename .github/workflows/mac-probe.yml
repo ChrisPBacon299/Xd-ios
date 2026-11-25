@@ -67,12 +67,20 @@ jobs:
           git ls-files > ../probe/files.txt
           grep -n "arm64\|COLO_BASE\|__game\|mmap\|MAP_JIT\|PROT_EXEC" host/macos.c host/colo.h 2>/dev/null | head -200 || true
 
+      - name: Restore compiled game units
+        uses: actions/cache/restore@v4
+        with:
+          path: unit-cache
+          key: units-${{ matrix.game }}-${{ github.sha }}
+          restore-keys: units-${{ matrix.game }}-
+
       - name: Build (Mac, arm64)
         env:
           COLO_GAME: ${{ matrix.game == 'xd' && 'xd' || '' }}
         run: |
           cd port
-          export COLO_PORT="$PWD" SMS_PORT="$PWD/deps/sms-pc-port"
+          export COLO_PORT="$PWD" SMS_PORT="$PWD/deps/sms-pc-port" COLO_UNIT_CACHE="$GITHUB_WORKSPACE/unit-cache"
+          mkdir -p "$COLO_UNIT_CACHE"
           if [ "${{ matrix.game }}" = xd ]; then export DECOMP="$PWD/deps/pkmn-xd"
           else
             export DECOMP="$PWD/deps/pkmn-colosseum"
@@ -81,6 +89,13 @@ jobs:
           set -o pipefail
           /bin/sh ./build.sh 2>&1 | tee ../probe/build.log
           ls -la build | tee -a ../probe/build.log
+
+      - name: Save compiled game units
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: unit-cache
+          key: units-${{ matrix.game }}-${{ github.sha }}
 
       - name: Start it with no disc (checks the code loads and runs from the executable)
         if: always()
