@@ -1,0 +1,73 @@
+# Step 1: build the port's own Mac (Apple silicon) version of Colosseum and XD, with no game files.
+# This proves the toolchain works on GitHub's Macs and records how the build is laid out, before
+# anything is changed for iOS. Nothing from any disc is used or stored here.
+name: Mac probe
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/mac-probe.yml
+      - pins.env
+jobs:
+  probe:
+    runs-on: macos-15
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        game: [colosseum, xd]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pinned commits
+        run: cat pins.env >> "$GITHUB_ENV"
+
+      - name: Install build tools
+        run: brew install cmake ninja llvm lld
+
+      - name: Fetch the port, the decomp and the renderer
+        run: |
+          set -x
+          fetch() { # url commit dir
+            git init -q "$3" && git -C "$3" remote add origin "$1"
+            git -C "$3" fetch -q --depth 1 origin "$2" && git -C "$3" checkout -q FETCH_HEAD
+          }
+          fetch "$PORT_REPO" "$PORT_COMMIT" port
+          if [ "${{ matrix.game }}" = xd ]; then
+            fetch "$XD_DECOMP_REPO" "$XD_DECOMP_COMMIT" port/deps/pkmn-xd
+          else
+            fetch "$COLO_DECOMP_REPO" "$COLO_DECOMP_COMMIT" port/deps/pkmn-colosseum
+          fi
+          ls port port/deps port/tools port/host | head -200
+
+      - name: Record the build layout
+        run: |
+          cd port
+          mkdir -p ../probe
+          for f in build.sh tools/link_macos.py tools/macos_deps.sh host/colo.h host/macos.c tools/ci/linux-build.sh; do
+            [ -f "$f" ] && { echo "=== $f"; cat "$f"; } >> ../probe/layout.txt
+          done
+          git ls-files > ../probe/files.txt
+          grep -n "arm64\|COLO_BASE\|__game\|mmap\|MAP_JIT\|PROT_EXEC" host/macos.c host/colo.h 2>/dev/null | head -200 || true
+
+      - name: Build (Mac, arm64)
+        env:
+          COLO_GAME: ${{ matrix.game == 'xd' && 'xd' || '' }}
+        run: |
+          cd port
+          export COLO_PORT="$PWD" SMS_PORT="$PWD/deps/sms-pc-port"
+          if [ "${{ matrix.game }}" = xd ]; then export DECOMP="$PWD/deps/pkmn-xd"
+          else
+            export DECOMP="$PWD/deps/pkmn-colosseum"
+            (cd "$DECOMP" && python3 configure.py > /dev/null)
+          fi
+          set -o pipefail
+          /bin/sh ./build.sh 2>&1 | tee ../probe/build.log
+          ls -la build | tee -a ../probe/build.log
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-${{ matrix.game }}
+          path: probe/
