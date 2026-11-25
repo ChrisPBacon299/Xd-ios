@@ -1,0 +1,79 @@
+# The iPhone app of each game: the port at the commit Orre Launcher pins (pins.env), with patches/*.patch, built on
+# the newest Xcode (the iPhone Duo needs the iOS 27.1 SDK or newer). Unsigned IPAs on the "test-builds" release, for a
+# sideloader to sign. No game files are used or included.
+name: iOS app
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ios/**
+      - patches/**
+      - pins.env
+      - .github/workflows/ios.yml
+permissions:
+  contents: write
+jobs:
+  app:
+    runs-on: xcode-27
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        game: [xd, colosseum]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read pinned commits
+        run: cat pins.env >> "$GITHUB_ENV"
+      - name: Pick the newest Xcode (iOS 27.1 SDK or newer)
+        run: |
+          X=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          sudo xcode-select -s "$X/Contents/Developer"
+          SDK=$(xcrun --sdk iphoneos --show-sdk-version)
+          echo "::notice title=SDK::$(basename $X), iOS SDK $SDK"
+          printf '%s\n27.1\n' "$SDK" | sort -V -C -r || { echo "::error::iOS SDK $SDK is older than 27.1"; exit 1; }
+      - name: Install build tools
+        run: brew install cmake ninja llvm lld
+      - name: Fetch the port and the decomp
+        run: |
+          fetch() { git init -q "$3" && git -C "$3" remote add origin "$1" && git -C "$3" fetch -q --depth 1 origin "$2" && git -C "$3" checkout -q FETCH_HEAD; }
+          fetch "$PORT_REPO" "$PORT_COMMIT" port
+          if [ "${{ matrix.game }}" = xd ]; then fetch "$XD_DECOMP_REPO" "$XD_DECOMP_COMMIT" port/deps/pkmn-xd
+          else fetch "$COLO_DECOMP_REPO" "$COLO_DECOMP_COMMIT" port/deps/pkmn-colosseum; fi
+          for p in patches/*.patch; do echo "applying $p"; git -C port apply --whitespace=nowarn "$PWD/$p"; done
+      - name: Restore compiled game units
+        uses: actions/cache/restore@v4
+        with:
+          path: unit-cache
+          key: units-ios-${{ matrix.game }}-${{ github.sha }}
+          restore-keys: |
+            units-ios-${{ matrix.game }}-
+            units-${{ matrix.game }}-
+      - name: Build the app
+        env:
+          COLO_GAME: ${{ matrix.game }}
+        run: |
+          mkdir -p build unit-cache
+          export COLO_UNIT_CACHE="$GITHUB_WORKSPACE/unit-cache"
+          set -o pipefail
+          sh ios/build-ios.sh 2>&1 | tee build/build.log
+      - name: Save compiled game units
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: unit-cache
+          key: units-ios-${{ matrix.game }}-${{ github.sha }}
+      - name: Report errors (as annotations, readable through the API)
+        if: always()
+        run: |
+          [ -f build/build.log ] || exit 0
+          grep -n -i -E "error|cannot|failed|undefined|such as|SystemExit|Traceback|refus|ld: " build/build.log | grep -v -E "warning:|Wdeprecated|Looking for|Performing Test|-Werror" | tail -60 > build/errors.txt || true
+          body=$(sed 's/%/%25/g' build/errors.txt | awk '{printf "%s%%0A", $0}'); echo "::warning title=errors (${{ matrix.game }})::$body"
+          body=$(grep -v '^\[[0-9]*/[0-9]*\]' build/build.log | tail -30 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}'); echo "::warning title=end (${{ matrix.game }})::$body"
+      - name: Publish the IPA
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          exe=$([ "${{ matrix.game }}" = xd ] && echo xd || echo colosseum)
+          gh release view test-builds >/dev/null 2>&1 || gh release create test-builds --prerelease --title "Test builds" --notes "Test apps. No game code or data."
+          cp "build/$exe.ipa" "build/Pokemon-$exe.ipa"
+          gh release upload test-builds "build/Pokemon-$exe.ipa" --clobber
