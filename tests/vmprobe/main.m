@@ -69,6 +69,40 @@ static void probe(void) {
     int fd = shm_open("/colo.probe", O_RDWR | O_CREAT, 0600);
     say(@"shm_open: %@", fd < 0 ? [NSString stringWithFormat:@"failed (%s)", strerror(errno)] : @"OK");
     if (fd >= 0) { close(fd); shm_unlink("/colo.probe"); }
+    // 4. The rest of the port's layout around the window: MEM1 mirrored just outside it
+    // (base - 2 GiB, base - 1 GiB, base + 4 GiB) and at the physical view (window + 64 KiB).
+    struct { const char *name; uint64_t at; } spots[] = {
+        { "base - 2 GiB", good - 2 * GiB }, { "base - 1 GiB", good - 1 * GiB }, { "base + 4 GiB", good + 4 * GiB },
+        { "window + 0xC0000000", good + 0xC0000000ull }, { "window + 0x10000", good + 0x10000ull } };
+    say(@"\nMEM1 mirrors:");
+    for (unsigned i = 0; i < sizeof spots / sizeof *spots; i++) {
+        uint64_t at = spots[i].at;
+        BOOL inside = at >= good && at < good + 4 * GiB;
+        if (!inside) {
+            vm_address_t q = at; vm_size_t qs = 0; uint32_t d = 0;
+            vm_region_submap_info_data_64_t qi; mach_msg_type_number_t qc = VM_REGION_SUBMAP_INFO_COUNT_64;
+            if (vm_region_recurse_64(mach_task_self(), &q, &qs, &d, (vm_region_recurse_info_t)&qi, &qc) == KERN_SUCCESS && q < at + sz) {
+                say(@"  %s: something already there", spots[i].name); continue;
+            }
+        }
+        vm_address_t to = at;
+        kern_return_t k = vm_remap(mach_task_self(), &to, sz, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
+                                   (vm_address_t)mem1, FALSE, &cur, &max, VM_INHERIT_NONE);
+        BOOL same = k == KERN_SUCCESS && ((uint8_t *)to)[100] == 0x5A;
+        say(@"  %s: %@", spots[i].name, k ? [NSString stringWithFormat:@"failed (%d)", k] : same ? @"OK" : @"not shared");
+        if (k == KERN_SUCCESS && !inside) munmap((void *)to, sz);
+    }
+    // 5. The free stretch of address space around the window.
+    vm_address_t lo = good, hi = good + 4 * GiB;
+    { vm_address_t q = 0; vm_size_t qs = 0; uint32_t d = 0; vm_address_t lastend = 0;
+      vm_region_submap_info_data_64_t qi; mach_msg_type_number_t qc;
+      for (;;) { qc = VM_REGION_SUBMAP_INFO_COUNT_64; d = 0;
+          if (vm_region_recurse_64(mach_task_self(), &q, &qs, &d, (vm_region_recurse_info_t)&qi, &qc) != KERN_SUCCESS) break;
+          if (q + qs <= good) lastend = q + qs;
+          else if (q >= good + 4 * GiB) { hi = q; break; }
+          q += qs; }
+      lo = lastend; if (hi == good + 4 * GiB) hi = 0; }
+    say(@"free from %.3f GiB to %@", lo / (double)GiB, hi ? [NSString stringWithFormat:@"%.3f GiB", hi / (double)GiB] : @"the end");
     munmap(win, 4 * GiB);
     say(@"\nused base: %llu GiB", good / GiB);
 }
