@@ -8,12 +8,15 @@ on:
     paths:
       - .github/workflows/mac-probe.yml
       - pins.env
+permissions:
+  contents: write
 jobs:
   probe:
     runs-on: macos-15
     timeout-minutes: 120
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         game: [colosseum, xd]
     steps:
@@ -65,9 +68,13 @@ jobs:
           /bin/sh ./build.sh 2>&1 | tee ../probe/build.log
           ls -la build | tee -a ../probe/build.log
 
-      - name: Keep the logs
+      - name: Keep the logs and a source snapshot (draft release, not public)
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: probe-${{ matrix.game }}
-          path: probe/
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tar -czf probe/source-${{ matrix.game }}.tar.gz --exclude=.git --exclude=build --exclude='orig' --exclude='*.iso' port
+          for f in probe/*; do mv "$f" "probe/${{ matrix.game }}-$(basename "$f" | sed 's/^source-${{ matrix.game }}/source/')"; done
+          gh release view probe -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create probe -R "$GITHUB_REPOSITORY" --draft --title "Build probe (private draft)" --notes "Logs and source snapshots for working on the iOS build. Draft: not public."
+          gh release upload probe probe/* -R "$GITHUB_REPOSITORY" --clobber
