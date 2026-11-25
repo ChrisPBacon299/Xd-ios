@@ -1,0 +1,36 @@
+# A tiny test app: which memory layouts iOS allows on the actual phone. Builds an unsigned IPA
+# (ad-hoc signed with the entitlements, for the sideloader to re-sign) and puts it on the
+# "test-builds" release. No game code or data.
+name: VM probe app
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - tests/vmprobe/**
+      - .github/workflows/vmprobe.yml
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the IPA
+        run: |
+          set -e
+          APP=build/Payload/VMProbe.app
+          mkdir -p "$APP"
+          xcrun -sdk iphoneos clang -target arm64-apple-ios16.0 -fobjc-arc -O1 \
+            tests/vmprobe/main.m -framework UIKit -framework Foundation -o "$APP/VMProbe"
+          cp tests/vmprobe/Info.plist "$APP/Info.plist"
+          plutil -convert binary1 "$APP/Info.plist"
+          codesign -f -s - --entitlements tests/vmprobe/entitlements.plist "$APP"
+          (cd build && zip -qry ../VMProbe.ipa Payload)
+          ls -la VMProbe.ipa
+      - name: Publish to the test-builds release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view test-builds >/dev/null 2>&1 || \
+            gh release create test-builds --prerelease --title "Test builds" --notes "Small test apps for checking iOS behaviour. No game code or data."
+          gh release upload test-builds VMProbe.ipa --clobber
